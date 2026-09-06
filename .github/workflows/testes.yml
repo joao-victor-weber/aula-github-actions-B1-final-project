@@ -1,22 +1,111 @@
-name: Testes
+name: CI/CD - Testes, Docker e Azure
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
+    branches:
+      - main
+
+env:
+  IMAGE_NAME: torikano/cadastro-pessoa-fisica
+  RESOURCE_GROUP: rg-cadastro-pessoa-fisica
+  CONTAINER_APP: cadastro-pessoa-fisica
 
 jobs:
-  testar:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Baixar o código
-        uses: actions/checkout@v4
 
-      - name: Instalar o Node
-        uses: actions/setup-node@v4
+  test:
+    name: Testes unitarios
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do codigo
+        uses: actions/checkout@v6
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v6
         with:
           node-version: 20
 
-      - name: Rodar a suíte
+      - name: Executar testes
         run: node --test
+
+
+  build:
+    name: Build e Push Docker
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout do codigo
+        uses: actions/checkout@v6
+
+      - name: Login no Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build e Push da imagem
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+
+
+  deploy:
+    name: Deploy Azure Container Apps
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push'
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Login no Azure usando OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Configurar extensao Container Apps
+        run: az extension add --name containerapp --upgrade
+
+      - name: Atualizar Container App
+        shell: bash
+        run: |
+          az containerapp update \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "${IMAGE_NAME}:${GITHUB_SHA}"
+
+      - name: Validar deploy
+        shell: bash
+        run: |
+          FQDN=$(az containerapp show \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query "properties.configuration.ingress.fqdn" \
+            --output tsv)
+
+          echo "Testando https://$FQDN"
+
+          curl \
+            --fail \
+            --retry 10 \
+            --retry-delay 5 \
+            "https://$FQDN"
+
+          echo "### Deploy concluido" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Aplicacao: https://$FQDN" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Imagem: ${IMAGE_NAME}:${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
